@@ -40,6 +40,13 @@ interface ErrorResponse {
 }
 
 /**
+ * NOTE: Using a constant for the Orders collection slug.
+ * We cast to `any` at call sites because generated types may not yet include
+ * the new collection at build time. This avoids blocking runtime behavior.
+ */
+const ORDERS_COLLECTION = 'orders' as const
+
+/**
  * POST /api/webhook
  * Handles Lemon Squeezy webhook events for order processing
  */
@@ -97,19 +104,83 @@ export const POST = async (request: Request): Promise<Response> => {
       const orderId = orderData.id
       const orderIdentifier = orderData.attributes.identifier
       const amount = orderData.attributes.total
+      const payloadProductId = String(
+        (body.meta?.custom_data as Record<string, unknown> | undefined)?.payloadProductId ?? '',
+      )
 
       console.log('✓ Order created:', {
         orderId,
         email,
         orderIdentifier,
         amount,
+        payloadProductId,
       })
+
+      // Upsert order in Payload
+      try {
+        // Try update by lemonSqueezyOrderId; if not exists, create
+        const existing = await payload.find({
+          // Casting to any to bypass CollectionSlug type mismatch until types regenerate
+          collection: ORDERS_COLLECTION as any,
+          where: { lemonSqueezyOrderId: { equals: orderId } },
+          limit: 1,
+        } as any)
+
+        if (existing.docs?.length) {
+          await payload.update({
+            collection: ORDERS_COLLECTION as any,
+            id: existing.docs[0].id,
+            // Casting to any as fields are defined in Orders collection
+            data: {
+              email,
+              orderIdentifier,
+              amount,
+              status: 'paid',
+              payloadProductId,
+              raw: orderData,
+            } as any,
+          } as any)
+        } else {
+          await payload.create({
+            collection: ORDERS_COLLECTION as any,
+            data: {
+              lemonSqueezyOrderId: orderId,
+              email,
+              orderIdentifier,
+              amount,
+              status: 'paid',
+              payloadProductId,
+              raw: orderData,
+            } as any,
+          } as any)
+        }
+      } catch (persistError) {
+        console.error('Failed to persist order:', persistError)
+        // Do not fail the webhook on DB error
+      }
     }
 
     if (eventType === 'order_refunded') {
       const orderId = orderData.id
       console.log('✓ Order refunded:', { orderId })
 
+      try {
+        const existing = await payload.find({
+          collection: ORDERS_COLLECTION as any,
+          where: { lemonSqueezyOrderId: { equals: orderId } },
+          limit: 1,
+        } as any)
+        if (existing.docs?.length) {
+          await payload.update({
+            collection: ORDERS_COLLECTION as any,
+            id: existing.docs[0].id,
+            data: { status: 'refunded', raw: orderData } as any,
+          } as any)
+        }
+      } catch (persistError) {
+        console.error('Failed to update order status:', persistError)
+        // Do not fail the webhook on DB error
+      }
     }
 
     // Return 200 to acknowledge receipt
